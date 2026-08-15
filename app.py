@@ -1,9 +1,12 @@
 import secrets
 import datetime
 from functools import wraps
-from flask import Flask, request, jsonify, render_template, redirect, url_for
+from flask import Flask, request, jsonify, render_template, redirect
 import bcrypt
 import jwt
+
+from flask_limiter import Limiter                     # <-- NEW
+from flask_limiter.util import get_remote_address     # <-- NEW
 
 from config import (
     JWT_SECRET, JWT_EXPIRATION, RESET_TOKEN_EXPIRATION, VERIFICATION_EXPIRATION
@@ -13,6 +16,18 @@ from utils.mail_service import send_email
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = JWT_SECRET
+
+# ---------- Rate Limiter Setup ----------           # <-- NEW
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
+
+# ---------- Error handler for 429 ----------        # <-- NEW
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    return jsonify({"error": "Too many requests. Please slow down."}), 429
 
 def generate_jwt(email):
     payload = {"sub": email, "exp": datetime.datetime.utcnow() + JWT_EXPIRATION}
@@ -39,8 +54,9 @@ def forgot_page():
 def reset_page():
     return render_template("reset_password.html", token=request.args.get("token"))
 
-# ---------- API Endpoints ----------
+# ---------- API Endpoints with Rate Limits ----------
 @app.route("/register", methods=["POST"])
+@limiter.limit("5 per minute")                        # <-- NEW
 def register():
     data = request.get_json()
     email, password = data.get("email"), data.get("password")
@@ -106,6 +122,7 @@ def verify_email():
     return render_template("verify_success.html")
 
 @app.route("/login", methods=["POST"])
+@limiter.limit("5 per minute")                        # <-- NEW
 def login():
     data = request.get_json()
     email, password = data.get("email"), data.get("password")
@@ -118,6 +135,7 @@ def login():
     return jsonify({"access_token": token}), 200
 
 @app.route("/forgot-password", methods=["POST"])
+@limiter.limit("5 per minute")                        # <-- NEW
 def forgot_password():
     data = request.get_json()
     email = data.get("email")
