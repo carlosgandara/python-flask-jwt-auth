@@ -1,12 +1,14 @@
 import secrets
 import datetime
+import time
+import threading
 from functools import wraps
 from flask import Flask, request, jsonify, render_template, redirect
 import bcrypt
 import jwt
 
-from flask_limiter import Limiter                     # <-- NEW
-from flask_limiter.util import get_remote_address     # <-- NEW
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 from config import (
     JWT_SECRET, JWT_EXPIRATION, RESET_TOKEN_EXPIRATION, VERIFICATION_EXPIRATION
@@ -17,18 +19,74 @@ from utils.mail_service import send_email
 app = Flask(__name__)
 app.config["SECRET_KEY"] = JWT_SECRET
 
-# ---------- Rate Limiter Setup ----------           # <-- NEW
+# ---------- Rate Limiter (IP‑based) ----------
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
     default_limits=["200 per day", "50 per hour"]
 )
 
-# ---------- Error handler for 429 ----------        # <-- NEW
 @app.errorhandler(429)
 def ratelimit_handler(e):
     return jsonify({"error": "Too many requests. Please slow down."}), 429
 
+# ---------- IP + User combo tracking (in‑memory) ----------
+ip_user_attempts = {}          # key: "ip:email", value: list of timestamps
+IP_USER_LIMIT = 5              # max attempts
+IP_USER_WINDOW = 300           # 5 minutes (in seconds)
+IP_USER_LOCK = threading.Lock()
+
+def get_client_ip():
+    """Get the real client IP, handling proxies."""
+    if request.headers.get('X-Forwarded-For'):
+        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    return request.remote_addr
+
+def cleanup_old_attempts():
+    """Remove expired entries to keep memory usage low."""
+    now = time.time()
+    with IP_USER_LOCK:
+        for key in list(ip_user_attempts.keys()):
+            # Keep only timestamps newer than IP_USER_WINDOW
+            ip_user_attempts[key] = [ts for ts in ip_user_attempts[key] if now - ts < IP_USER_WINDOW]
+            if not ip_user_attempts[key]:
+                del ip_user_attempts[key]
+
+def is_ip_user_rate_limited(ip, email):
+    """Check if (ip, email) exceeds the allowed attempts."""
+    key = f"{ip}:{email}"
+    now = time.time()
+    with IP_USER_LOCK:
+        # Clean up expired timestamps for this key
+        if key in ip_user_attempts:
+            ip_user_attempts[key] = [ts for ts in ip_user_attempts[key] if now - ts < IP_USER_WINDOW]
+            if not ip_user_attempts[key]:
+                del ip_user_attempts[key]
+                return False
+            # Check count
+            if len(ip_user_attempts[key]) >= IP_USER_LIMIT:
+                return True
+        return False
+
+def add_ip_user_attempt(ip, email):
+    """Record a failed attempt for (ip, email)."""
+    key = f"{ip}:{email}"
+    now = time.time()
+    with IP_USER_LOCK:
+        if key not in ip_user_attempts:
+            ip_user_attempts[key] = []
+        ip_user_attempts[key].append(now)
+        # Trim old entries (just in case)
+        ip_user_attempts[key] = [ts for ts in ip_user_attempts[key] if now - ts < IP_USER_WINDOW]
+
+def clear_ip_user_attempts(ip, email):
+    """Clear failed attempts on successful login."""
+    key = f"{ip}:{email}"
+    with IP_USER_LOCK:
+        if key in ip_user_attempts:
+            del ip_user_attempts[key]
+
+# ---------- Helper functions ----------
 def generate_jwt(email):
     payload = {"sub": email, "exp": datetime.datetime.utcnow() + JWT_EXPIRATION}
     return jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
@@ -54,9 +112,9 @@ def forgot_page():
 def reset_page():
     return render_template("reset_password.html", token=request.args.get("token"))
 
-# ---------- API Endpoints with Rate Limits ----------
+# ---------- API Endpoints ----------
 @app.route("/register", methods=["POST"])
-@limiter.limit("5 per minute")                        # <-- NEW
+@limiter.limit("5 per minute")
 def register():
     data = request.get_json()
     email, password = data.get("email"), data.get("password")
@@ -121,21 +179,67 @@ def verify_email():
     })
     return render_template("verify_success.html")
 
+# ---------- LOGIN with IP + User combo & Lockout ----------
 @app.route("/login", methods=["POST"])
-@limiter.limit("5 per minute")                        # <-- NEW
+@limiter.limit("5 per minute")   # IP‑based global limit
 def login():
     data = request.get_json()
     email, password = data.get("email"), data.get("password")
+    ip = get_client_ip()
+
+    # Cleanup old entries occasionally
+    cleanup_old_attempts()
+
+    # Check IP + User combo rate limit FIRST (before any DB lookup)
+    if is_ip_user_rate_limited(ip, email):
+        return jsonify({
+            "error": "Too many failed login attempts from this IP for this user. Please wait 5 minutes."
+        }), 429
+
     user = find_user_by_email(email)
-    if not user or not bcrypt.checkpw(password.encode("utf-8"), user["password"].encode("utf-8")):
+    if not user:
+        # Record attempt even if user doesn't exist (avoid user enumeration)
+        add_ip_user_attempt(ip, email)
         return jsonify({"error": "Invalid credentials"}), 401
+
+    # ---- Per‑user lockout check ----
+    locked_until_str = user.get("locked_until")
+    if locked_until_str:
+        locked_until = datetime.datetime.fromisoformat(locked_until_str)
+        if locked_until > datetime.datetime.utcnow():
+            remaining = int((locked_until - datetime.datetime.utcnow()).total_seconds() / 60)
+            return jsonify({
+                "error": f"Account locked. Try again in {remaining} minute(s)."
+            }), 403
+
+    # ---- Password check ----
+    if not bcrypt.checkpw(password.encode("utf-8"), user["password"].encode("utf-8")):
+        # Record the failed attempt for (IP, email)
+        add_ip_user_attempt(ip, email)
+
+        # Increment per‑user failed attempts (lockout logic)
+        attempts = user.get("failed_login_attempts", 0) + 1
+        updates = {"failed_login_attempts": attempts}
+        if attempts >= 5:
+            locked_until = datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+            updates["locked_until"] = locked_until.isoformat()
+        update_user(email, updates)
+        return jsonify({"error": "Invalid credentials"}), 401
+
     if not user.get("verified", False):
         return jsonify({"error": "Please verify your email first."}), 403
+
+    # ---- Success: reset counters and unlock ----
+    update_user(email, {
+        "failed_login_attempts": 0,
+        "locked_until": None
+    })
+    clear_ip_user_attempts(ip, email)   # clear the IP+user tracking
     token = generate_jwt(email)
     return jsonify({"access_token": token}), 200
 
 @app.route("/forgot-password", methods=["POST"])
-@limiter.limit("5 per minute")                        # <-- NEW
+@limiter.limit("5 per minute")
 def forgot_password():
     data = request.get_json()
     email = data.get("email")
@@ -163,6 +267,7 @@ def forgot_password():
     return jsonify({"message": "If that email exists, a reset link was sent"}), 200
 
 @app.route("/reset-password", methods=["POST"])
+@limiter.limit("5 per minute")
 def reset_password():
     data = request.get_json()
     token, new_password = data.get("token"), data.get("new_password")
